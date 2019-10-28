@@ -448,7 +448,7 @@ function prepare_disks {
 
 function create_temp_volume {
   zfs create -V 10G "$v_rpool_name/os-install-temp"
-
+  udevadm settle
   v_temp_volume_device=$(readlink -f "/dev/zvol/$v_rpool_name/os-install-temp")
 
   sgdisk -n1:0:0 -t1:8300 "$v_temp_volume_device"
