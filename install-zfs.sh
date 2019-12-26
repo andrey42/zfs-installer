@@ -4,8 +4,8 @@
 # Shellcheck issue descriptions:
 #
 # - SC2015: <condition> && <operation> || true
-# - SC2016: annoying warning about using single quoted strings with characters used for interpolation;
-# - SC2034: triggers a bug on the `-v` test (see https://git.io/Jenyu).
+# - SC2016: annoying warning about using single quoted strings with characters used for interpolation
+# - SC2034: triggers a bug on the `-v` test (see https://git.io/Jenyu)
 
 set -o errexit
 set -o pipefail
@@ -13,24 +13,70 @@ set -o nounset
 
 # VARIABLES/CONSTANTS ##########################################################
 
+# Variables set (indirectly) by the user
+
 v_bpool_name=
 v_bpool_tweaks=              # see defaults below for format
+v_linux_distribution=        # Debian, Ubuntu, ...
+v_linux_distribution_version=
 v_encrypt_rpool=             # 0=false, 1=true
 v_passphrase=
+v_root_password=             # Debian-only
 v_rpool_name=
 v_rpool_tweaks=              # see defaults below for format
 declare -a v_selected_disks  # (/dev/by-id/disk_id, ...)
 v_swap_size=                 # integer
 v_free_tail_space=           # integer
-declare -a v_system_disks    # (/dev/by-id/disk_id, ...)
-v_temp_volume_device=        # /dev/zdN
+
+# Variables set during execution
+
+v_temp_volume_device=        # /dev/zdN; scope: create_temp_volume -> install_operating_system
+declare -a v_system_disks    # (/dev/by-id/disk_id, ...); scope: find_disks -> select_disk
+
+# Constants
 
 c_default_bpool_tweaks="-o ashift=12"
 c_default_rpool_tweaks="-o ashift=12 -O acltype=posixacl -O compression=lz4 -O dnodesize=auto -O relatime=on -O xattr=sa -O normalization=formD"
-c_mount_dir=/mnt
-c_ubiquity_destination_mount=/target
+c_zfs_mount_dir=/mnt
+c_installed_os_data_mount_dir=/target
+declare -A c_supported_linux_distributions=([Ubuntu]=18.04 [LinuxMint]=19 [Debian]=10 [elementary]=5.1)
+c_temporary_volume_size=12G  # large enough; Debian, for example, takes ~8 GiB.
 
 # HELPER FUNCTIONS #############################################################
+
+# Chooses a function and invokes it depending on the O/S distribution.
+#
+# Example:
+#
+#   $ function install_jail_zfs_packages { :; }
+#   $ function install_jail_zfs_packages_Debian { :; }
+#   $ distro_dependent_invoke "install_jail_zfs_packages"
+#
+# If the distribution is `Debian`, the second will be invoked, otherwise, the
+# first.
+#
+# If the function is invoked with `--noforce` as second parameter, and there is
+# no matching function:
+#
+#   $ function update_zed_cache_Ubuntu { :; }
+#   $ distro_dependent_invoke "install_jail_zfs_packages" --noforce
+#
+# then nothing happens. Without `--noforce`, this invocation will cause an
+# error.
+#
+function distro_dependent_invoke {
+  local distro_specific_fx_name="$1_$v_linux_distribution"
+
+  if declare -f "$distro_specific_fx_name" > /dev/null; then
+    "$distro_specific_fx_name"
+  else
+    if ! declare -f "$1" > /dev/null && [[ "${2:-}" == "--noforce" ]]; then
+      : # do nothing
+    else
+      "$1"
+    fi
+  fi
+}
 
 # shellcheck disable=SC2120 # allow parameters passing even if no calls pass any
 function print_step_info_header {
@@ -74,7 +120,7 @@ function print_variables {
 }
 
 function chroot_execute {
-  chroot $c_mount_dir bash -c "$1"
+  chroot $c_zfs_mount_dir bash -c "$1"
 }
 
 # PROCEDURE STEP FUNCTIONS #####################################################
@@ -93,6 +139,7 @@ The procedure can be entirely automated via environment variables:
 - ZFS_SELECTED_DISKS         : full path of the devices to create the pool on, comma-separated
 - ZFS_ENCRYPT_RPOOL          : set 1 to encrypt the pool
 - ZFS_PASSPHRASE
+- ZFS_DEBIAN_ROOT_PASSWORD
 - ZFS_BPOOL_NAME
 - ZFS_RPOOL_NAME
 - ZFS_BPOOL_TWEAKS           : boot pool options to set on creation (defaults to `'$c_default_bpool_tweaks'`)
@@ -103,11 +150,11 @@ The procedure can be entirely automated via environment variables:
 
 - ZFS_SKIP_LIVE_ZFS_MODULE_INSTALL : (debug) set 1 to skip installing the ZFS package on the live system; speeds up installation on preset machines
 
-When installing the O/S via $ZFS_OS_INSTALLATION_SCRIPT, the root pool is mounted as `'$c_mount_dir'`; the requisites are:
+When installing the O/S via $ZFS_OS_INSTALLATION_SCRIPT, the root pool is mounted as `'$c_zfs_mount_dir'`; the requisites are:
 
-1. the virtual filesystems must be mounted in `'$c_mount_dir'` (ie. `for vfs in proc sys dev; do mount --rbind /$vfs '$c_mount_dir'/$vfs; done`)
-2. internet must be accessible while chrooting in `'$c_mount_dir'` (ie. `echo nameserver 8.8.8.8 >> '$c_mount_dir'/etc/resolv.conf`)
-3. `'$c_mount_dir'` must be left in a dismountable state (e.g. no file locks, no swap etc.);
+1. the virtual filesystems must be mounted in `'$c_zfs_mount_dir'` (ie. `for vfs in proc sys dev; do mount --rbind /$vfs '$c_zfs_mount_dir'/$vfs; done`)
+2. internet must be accessible while chrooting in `'$c_zfs_mount_dir'` (ie. `echo nameserver 8.8.8.8 >> '$c_zfs_mount_dir'/etc/resolv.conf`)
+3. `'$c_zfs_mount_dir'` must be left in a dismountable state (e.g. no file locks, no swap etc.);
 '
 
   echo "$help"
@@ -123,9 +170,28 @@ function activate_debug {
   set -x
 }
 
+function print_preset_variables {
+  cat <<SHELL
+# Preset variables for rerun:
+
+ZFS_SELECTED_DISKS=$(printf "%s," "${v_selected_disks[@]}" | sed 's/.$//') \\
+ZFS_ENCRYPT_RPOOL=$v_encrypt_rpool ZFS_PASSPHRASE=$v_passphrase \\
+ZFS_BPOOL_NAME=$v_bpool_name ZFS_RPOOL_NAME=$v_rpool_name \\
+ZFS_BPOOL_TWEAKS="$v_bpool_tweaks" ZFS_RPOOL_TWEAKS="$v_rpool_tweaks" \\
+ZFS_SWAP_SIZE=$v_swap_size ZFS_FREE_TAIL_SPACE=$v_free_tail_space
+SHELL
+}
+
+function set_distribution_data {
+  v_linux_distribution="$(lsb_release --id --short)"
+  v_linux_version="$(lsb_release --release --short)"
+}
+
 function check_prerequisites {
   print_step_info_header
 
+  # shellcheck disable=SC2116 # `=~ $(echo ...)` causes a warning; see https://git.io/Je2QP.
+  #
   if [[ ! -d /sys/firmware/efi ]]; then
     echo 'System firmware directory not found; make sure to boot in EFI mode!'
     exit 1
@@ -134,6 +200,12 @@ function check_prerequisites {
     exit 1
   elif [[ "${ZFS_OS_INSTALLATION_SCRIPT:-}" != "" && ! -x "$ZFS_OS_INSTALLATION_SCRIPT" ]]; then
     echo "The custom O/S installation script provided doesn't exist or is not executable!"
+    exit 1
+  elif [[ ! -v c_supported_linux_distributions["$v_linux_distribution"] ]]; then
+    echo "This Linux distribution ($v_linux_distribution) is not supported!"
+    exit 1
+  elif [[ ! $v_linux_version =~ $(echo "^${c_supported_linux_distributions["$v_linux_distribution"]}\\b") ]]; then
+    echo "This Linux distribution version ($v_linux_version) is not supported; version supported: ${c_supported_linux_distributions["$v_linux_distribution"]}"
     exit 1
   fi
 }
@@ -204,6 +276,26 @@ Devices with mounted partitions, cdroms, and removable devices are not displayed
   fi
 
   print_variables v_selected_disks
+}
+
+function ask_root_password_Debian {
+  print_step_info_header
+
+  set +x
+  if [[ ${ZFS_DEBIAN_ROOT_PASSWORD:-} != "" ]]; then
+    v_root_password="$ZFS_DEBIAN_ROOT_PASSWORD"
+  else
+    local password_invalid_message=
+    local password_repeat=-
+
+    while [[ "$v_root_password" != "$password_repeat" || "$v_root_password" == "" ]]; do
+      v_root_password=$(whiptail --passwordbox "${password_invalid_message}Please enter the root account password (can't be empty):" 30 100 3>&1 1>&2 2>&3)
+      password_repeat=$(whiptail --passwordbox "Please repeat the password:" 30 100 3>&1 1>&2 2>&3)
+
+      password_invalid_message="Passphrase empty, or not matching! "
+    done
+  fi
+  set -x
 }
 
 function ask_encryption {
@@ -319,20 +411,57 @@ function ask_pool_tweaks {
   print_variables v_bpool_tweaks v_rpool_tweaks
 }
 
-function install_zfs_module {
+function install_host_zfs_module {
   print_step_info_header
 
   if [[ ${ZFS_SKIP_LIVE_ZFS_MODULE_INSTALL:-} == "" ]]; then
     echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
 
     add-apt-repository --yes ppa:jonathonf/zfs
-    apt install --yes zfs-dkms
+
+    # Required only on LinuxMint, which doesn't update the apt data when invoking `add-apt-repository`.
+    # With the current design, it's arguably preferrable to introduce a redundant operation (for
+    # Ubuntu), rather than adding an almost entirely duplicated function.
+    #
+    apt update
+
+    # Libelf-dev allows `CONFIG_STACK_VALIDATION` to be set - it's optional, but good to have.
+    # Module compilation log: `/var/lib/dkms/zfs/0.8.2/build/make.log` (adjust according to version).
+    #
+    apt install --yes libelf-dev zfs-dkms
 
     systemctl stop zfs-zed
     modprobe -r zfs
     modprobe zfs
     systemctl start zfs-zed
   fi
+}
+
+function install_host_zfs_module_Debian {
+  print_step_info_header
+
+  if [[ ${ZFS_SKIP_LIVE_ZFS_MODULE_INSTALL:-} == "" ]]; then
+    echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
+
+    echo "deb http://deb.debian.org/debian buster contrib" >> /etc/apt/sources.list
+    echo "deb http://deb.debian.org/debian buster-backports main contrib" >> /etc/apt/sources.list
+    apt update
+
+    apt install --yes -t buster-backports zfs-dkms
+
+    modprobe zfs
+  fi
+}
+
+function install_host_zfs_module_elementary {
+  print_step_info_header
+
+  if [[ ${ZFS_SKIP_LIVE_ZFS_MODULE_INSTALL:-} == "" ]]; then
+    apt update
+    apt install -y software-properties-common
+  fi
+
+  install_host_zfs_module
 }
 
 function prepare_disks {
@@ -423,7 +552,7 @@ function prepare_disks {
   echo -n "$v_passphrase" | zpool create \
     "${encryption_options[@]}" \
     $v_rpool_tweaks \
-    -O devices=off -O mountpoint=/ -R "$c_mount_dir" -f \
+    -O devices=off -O mountpoint=/ -R "$c_zfs_mount_dir" -f \
     "$v_rpool_name" $pools_mirror_option "${rpool_disks_partitions[@]}"
 
   # `-d` disable all the pool features (not used here);
@@ -431,7 +560,7 @@ function prepare_disks {
   # shellcheck disable=SC2086 # see previous command
   zpool create \
     $v_bpool_tweaks \
-    -O devices=off -O mountpoint=/boot -R "$c_mount_dir" -f \
+    -O devices=off -O mountpoint=/boot -R "$c_zfs_mount_dir" -f \
     "$v_bpool_name" $pools_mirror_option "${bpool_disks_partitions[@]}"
 
   # SWAP ###############################
@@ -447,11 +576,26 @@ function prepare_disks {
 }
 
 function create_temp_volume {
-  zfs create -V 10G "$v_rpool_name/os-install-temp"
+  zfs create -V "$c_temporary_volume_size" "$v_rpool_name/os-install-temp"
+
+  # The volume may not be immediately available; for reference, "/dev/zvol/.../os-install-temp"
+  # is a standard file, which turns into symlink once the volume is available. See #8.
+  #
   udevadm settle
+
   v_temp_volume_device=$(readlink -f "/dev/zvol/$v_rpool_name/os-install-temp")
 
   sgdisk -n1:0:0 -t1:8300 "$v_temp_volume_device"
+
+  udevadm settle
+}
+
+# Differently from Ubuntu, the installer (Calamares) requires a filesystem to be ready.
+#
+function create_temp_volume_Debian {
+  create_temp_volume
+
+  mkfs.ext4 -F "$v_temp_volume_device"
 }
 
 function install_operating_system {
@@ -485,9 +629,50 @@ Proceed with the configuration as usual, then, at the partitioning stage:
   #
   # Note that we assume that the user created only one partition on the temp volume, as expected.
   #
-  if ! mountpoint -q "$c_ubiquity_destination_mount"; then
-    mount "${v_temp_volume_device}p1" "$c_ubiquity_destination_mount"
+  if ! mountpoint -q "$c_installed_os_data_mount_dir"; then
+    mount "${v_temp_volume_device}p1" "$c_installed_os_data_mount_dir"
   fi
+}
+
+function install_operating_system_Debian {
+  print_step_info_header
+
+  local dialog_message='The Debian GUI installer will now be launched.
+
+Proceed with the configuration as usual, then, at the partitioning stage:
+
+- check `Manual partitioning` -> `Next`
+- set `Storage device` to `Unknown - 10.0 GB '"${v_temp_volume_device}"'`
+- click on `'"${v_temp_volume_device}"'` in the filesystems panel -> `Edit`
+  - set `Mount Point` to `/` -> `OK`
+- `Next`
+- follow through the installation (ignore the EFI partition warning)
+- at the end, uncheck `Restart now`, and click `Done`
+'
+
+  if [[ ${ZFS_NO_INFO_MESSAGES:-} == "" ]]; then
+    whiptail --msgbox "$dialog_message" 30 100
+  fi
+
+  calamares
+
+  mkdir -p "$c_installed_os_data_mount_dir"
+
+  # Note how in Debian, for reasons currenly unclear, the mount fails if the partition is passed;
+  # it requires the device to be passed.
+  #
+  mount "${v_temp_volume_device}" "$c_installed_os_data_mount_dir"
+
+  chroot_execute "echo root:$(printf "%q" "$v_root_password") | chpasswd"
+
+  # The installer doesn't set the network interfaces, so, for convenience, we do it.
+  #
+  for interface in $(ip addr show | perl -lne '/^\d+: (?!lo:)(\w+)/ && print $1' ); do
+    cat > "$c_installed_os_data_mount_dir/etc/network/interfaces.d/$interface" <<CONF
+  auto $interface
+  iface $interface inet dhcp
+CONF
+  done
 }
 
 function sync_os_temp_installation_dir_to_rpool {
@@ -495,11 +680,11 @@ function sync_os_temp_installation_dir_to_rpool {
   # There isn't an exact way to filter out filenames in the rsync output, so we just use a good enough heuristic.
   # ❤️ Perl ❤️
   #
-  rsync -avX --exclude=/swapfile --info=progress2 --no-inc-recursive --human-readable "$c_ubiquity_destination_mount/" "$c_mount_dir" |
+  rsync -avX --exclude=/swapfile --info=progress2 --no-inc-recursive --human-readable "$c_installed_os_data_mount_dir/" "$c_zfs_mount_dir" |
     perl -lane 'BEGIN { $/ = "\r"; $|++ } $F[1] =~ /(\d+)%$/ && print $1' |
     whiptail --gauge "Syncing the installed O/S to the root pool FS..." 30 100 0
 
-  umount "$c_ubiquity_destination_mount"
+  umount "$c_installed_os_data_mount_dir"
 }
 
 function destroy_temp_volume {
@@ -510,7 +695,7 @@ function prepare_jail {
   print_step_info_header
 
   for virtual_fs_dir in proc sys dev; do
-    mount --rbind "/$virtual_fs_dir" "$c_mount_dir/$virtual_fs_dir"
+    mount --rbind "/$virtual_fs_dir" "$c_zfs_mount_dir/$virtual_fs_dir"
   done
 
   chroot_execute 'echo "nameserver 8.8.8.8" >> /etc/resolv.conf'
@@ -522,12 +707,47 @@ function custom_install_operating_system {
   sudo "$ZFS_OS_INSTALLATION_SCRIPT"
 }
 
-function install_zfs_0.8_packages {
+# See install_host_zfs_module() for some comments.
+#
+function install_jail_zfs_packages {
   print_step_info_header
 
   chroot_execute "add-apt-repository --yes ppa:jonathonf/zfs"
+
+  chroot_execute "apt update"
+
+  chroot_execute 'echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections'
+
+  chroot_execute "apt install --yes libelf-dev zfs-initramfs zfs-dkms grub-efi-amd64-signed shim-signed"
+}
+
+function install_jail_zfs_packages_Debian {
+  print_step_info_header
+
+  chroot_execute 'echo "deb http://deb.debian.org/debian buster main contrib"     >> /etc/apt/sources.list'
+  chroot_execute 'echo "deb-src http://deb.debian.org/debian buster main contrib" >> /etc/apt/sources.list'
+
+  chroot_execute 'echo "deb http://deb.debian.org/debian buster-backports main contrib"     >> /etc/apt/sources.list.d/buster-backports.list'
+  chroot_execute 'echo "deb-src http://deb.debian.org/debian buster-backports main contrib" >> /etc/apt/sources.list.d/buster-backports.list'
+
+  chroot_execute 'cat > /etc/apt/preferences.d/90_zfs <<APT
+Package: libnvpair1linux libuutil1linux libzfs2linux libzpool2linux zfs-dkms zfs-initramfs zfs-test zfsutils-linux zfsutils-linux-dev zfs-zed
+Pin: release n=buster-backports
+Pin-Priority: 990
+APT'
+
+  chroot_execute "apt update"
+
   chroot_execute 'echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections'
   chroot_execute "apt install --yes zfs-initramfs zfs-dkms grub-efi-amd64-signed shim-signed"
+}
+
+function install_jail_zfs_packages_elementary {
+  print_step_info_header
+
+  chroot_execute "apt install -y software-properties-common"
+
+  install_jail_zfs_packages
 }
 
 function install_and_configure_bootloader {
@@ -541,6 +761,9 @@ function install_and_configure_bootloader {
   chroot_execute "grub-install"
 
   chroot_execute "perl -i -pe 's/(GRUB_CMDLINE_LINUX=\")/\${1}root=ZFS=$v_rpool_name /'    /etc/default/grub"
+
+  # Silence warning during the grub probe (source: https://git.io/JenXF).
+  #
   chroot_execute "echo 'GRUB_DISABLE_OS_PROBER=true'                                    >> /etc/default/grub"
 
   # Simplify debugging, but most importantly, disable the boot graphical interface: text mode is
@@ -558,6 +781,25 @@ function install_and_configure_bootloader {
   # A gist on GitHub (https://git.io/JenXF) manipulates `/etc/grub.d/10_linux` in order to allow
   # GRUB support encrypted ZFS partitions. This hasn't been a requirement in all the tests
   # performed on 18.04, but it's better to keep this reference just in case.
+
+  chroot_execute "update-grub"
+
+  chroot_execute "umount /boot/efi"
+}
+
+function install_and_configure_bootloader_Debian {
+  print_step_info_header
+
+  chroot_execute "echo PARTUUID=$(blkid -s PARTUUID -o value "${v_selected_disks[0]}-part1") /boot/efi vfat nofail,x-systemd.device-timeout=1 0 1 > /etc/fstab"
+
+  chroot_execute "mkdir -p /boot/efi"
+  chroot_execute "mount /boot/efi"
+
+  chroot_execute "grub-install"
+
+  chroot_execute "perl -i -pe 's/(GRUB_CMDLINE_LINUX=\")/\${1}root=ZFS=$v_rpool_name /' /etc/default/grub"
+  chroot_execute "perl -i -pe 's/(GRUB_CMDLINE_LINUX_DEFAULT=.*)quiet/\$1/'             /etc/default/grub"
+  chroot_execute "perl -i -pe 's/#(GRUB_TERMINAL=console)/\$1/'                         /etc/default/grub"
 
   chroot_execute "update-grub"
 
@@ -597,6 +839,19 @@ UNIT"
   chroot_execute "echo $v_bpool_name /boot zfs nodev,relatime,x-systemd.requires=zfs-import-$v_bpool_name.service 0 0 >> /etc/fstab"
 }
 
+function update_zed_cache_Debian {
+  chroot_execute "mkdir /etc/zfs/zfs-list.cache"
+  chroot_execute "touch /etc/zfs/zfs-list.cache/$v_rpool_name"
+  chroot_execute "ln -s /usr/lib/zfs-linux/zed.d/history_event-zfs-list-cacher.sh /etc/zfs/zed.d/"
+
+  chroot_execute "zed -F &"
+  chroot_execute "[[ ! -s /etc/zfs/zfs-list.cache/$v_rpool_name ]] && zfs set canmount=noauto $v_rpool_name || true"
+  chroot_execute "[[ ! -s /etc/zfs/zfs-list.cache/$v_rpool_name ]] && false"
+  chroot_execute "pkill zed"
+
+  chroot_execute "sed -Ei 's|$c_installed_os_data_mount_dir/?|/|' /etc/zfs/zfs-list.cache/$v_rpool_name"
+}
+
 function configure_remaining_settings {
   print_step_info_header
 
@@ -608,7 +863,7 @@ function prepare_for_system_exit {
   print_step_info_header
 
   for virtual_fs_dir in dev sys proc; do
-    umount --recursive --force --lazy "$c_mount_dir/$virtual_fs_dir"
+    umount --recursive --force --lazy "$c_zfs_mount_dir/$virtual_fs_dir"
   done
 
   # In one case, a second unmount was required. In this contenxt, bind mounts are not safe, so,
@@ -620,7 +875,7 @@ function prepare_for_system_exit {
   SECONDS=0
 
   for virtual_fs_dir in dev sys proc; do
-    while mountpoint -q "$c_mount_dir/$virtual_fs_dir" && [[ $SECONDS -lt $max_unmount_wait ]]; do
+    while mountpoint -q "$c_zfs_mount_dir/$virtual_fs_dir" && [[ $SECONDS -lt $max_unmount_wait ]]; do
       sleep 0.5
       echo -n .
     done
@@ -629,9 +884,9 @@ function prepare_for_system_exit {
   echo
 
   for virtual_fs_dir in dev sys proc; do
-    if mountpoint -q "$c_mount_dir/$virtual_fs_dir"; then
-      echo "Re-issuing umount for $c_mount_dir/$virtual_fs_dir"
-      umount --recursive --force --lazy "$c_mount_dir/$virtual_fs_dir"
+    if mountpoint -q "$c_zfs_mount_dir/$virtual_fs_dir"; then
+      echo "Re-issuing umount for $c_zfs_mount_dir/$virtual_fs_dir"
+      umount --recursive --force --lazy "$c_zfs_mount_dir/$virtual_fs_dir"
     fi
   done
 
@@ -657,23 +912,29 @@ if [[ $# -ne 0 ]]; then
 fi
 
 activate_debug
+trap print_preset_variables ERR
+set_distribution_data
 check_prerequisites
 display_intro_banner
 find_disks
 
 select_disks
+distro_dependent_invoke "ask_root_password" --noforce
 ask_encryption
 ask_swap_size
 ask_free_tail_space
 ask_pool_names
 ask_pool_tweaks
 
-install_zfs_module
+distro_dependent_invoke "install_host_zfs_module"
 prepare_disks
 
 if [[ "${ZFS_OS_INSTALLATION_SCRIPT:-}" == "" ]]; then
-  create_temp_volume
-  install_operating_system
+  distro_dependent_invoke "create_temp_volume"
+
+  # Includes the O/S extra configuration, if necessary (network, root pwd, etc.)
+  distro_dependent_invoke "install_operating_system"
+
   sync_os_temp_installation_dir_to_rpool
   destroy_temp_volume
   prepare_jail
@@ -681,10 +942,11 @@ else
   custom_install_operating_system
 fi
 
-install_zfs_0.8_packages
-install_and_configure_bootloader
+distro_dependent_invoke "install_jail_zfs_packages"
+distro_dependent_invoke "install_and_configure_bootloader"
 clone_efi_partition
 configure_boot_pool_import
+distro_dependent_invoke "update_zed_cache" --noforce
 configure_remaining_settings
 
 prepare_for_system_exit
