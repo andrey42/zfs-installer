@@ -417,7 +417,9 @@ function install_host_zfs_module {
   if [[ ${ZFS_SKIP_LIVE_ZFS_MODULE_INSTALL:-} == "" ]]; then
     echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
 
-    add-apt-repository --yes ppa:jonathonf/zfs
+#    add-apt-repository --yes ppa:jonathonf/zfs
+    wget -O - https://apt.terem.fr/apt_pub.gpg | apt-key add -
+    add-apt-repository 'deb http://apt.terem.fr/public bionic main'
 
     # Required only on LinuxMint, which doesn't update the apt data when invoking `add-apt-repository`.
     # With the current design, it's arguably preferrable to introduce a redundant operation (for
@@ -712,7 +714,9 @@ function custom_install_operating_system {
 function install_jail_zfs_packages {
   print_step_info_header
 
-  chroot_execute "add-apt-repository --yes ppa:jonathonf/zfs"
+#  chroot_execute "add-apt-repository --yes ppa:jonathonf/zfs"
+  chroot_execute "wget -O - https://apt.terem.fr/apt_pub.gpg | apt-key add -"
+  chroot_execute "add-apt-repository 'deb http://apt.terem.fr/public bionic main'"
 
   chroot_execute "apt update"
 
